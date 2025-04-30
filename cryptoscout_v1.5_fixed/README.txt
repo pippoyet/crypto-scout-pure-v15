@@ -1,0 +1,1 @@
+Questa è una versione aggiornata di CryptoScout PURE v1.5 con correzioni al ciclo, filtro Coinbase, log e soglie.
