@@ -3,11 +3,13 @@ import time
 from datetime import datetime
 import pytz
 import telegram
-from config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, COINBASE_ONLY, ALERT_THRESHOLD_PERCENT, MONITOR_INTERVAL_MINUTES, TIMEZONE
+from collections import deque
+from config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, COINBASE_ONLY, ALERT_THRESHOLD_PERCENT, TIMEZONE
 
 bot = telegram.Bot(token=TELEGRAM_TOKEN)
 
-previous_prices = {}
+# Salviamo gli ultimi 2 prezzi (cioè 10 minuti fa e ora)
+previous_prices = {}  # base: deque(maxlen=2)
 
 def get_coinbase_prices():
     url = "https://api.coinbase.com/v2/prices/USD/spot"
@@ -46,18 +48,23 @@ def monitor():
                 base = entry.get("base")
                 amount = float(entry.get("amount"))
 
-                if base in previous_prices:
-                    prev = previous_prices[base]
-                    change_pct = ((amount - prev) / prev) * 100
+                # Inizializza la coda se non esiste
+                if base not in previous_prices:
+                    previous_prices[base] = deque(maxlen=2)
+
+                price_history = previous_prices[base]
+                price_history.append(amount)
+
+                if len(price_history) == 2:
+                    old_price = price_history[0]
+                    change_pct = ((amount - old_price) / old_price) * 100
                     if abs(change_pct) >= ALERT_THRESHOLD_PERCENT:
                         direction = "📈" if change_pct > 0 else "📉"
-                        msg = f"{direction} {now} - {base} ha avuto una variazione del {change_pct:.2f}% ed è ora a {amount} USD."
+                        msg = f"{direction} {now} - {base} ha avuto una variazione del {change_pct:.2f}% negli ultimi 10 minuti. Ora a {amount} USD."
                         send_alert(msg)
 
-                previous_prices[base] = amount
-
-        time.sleep(MONITOR_INTERVAL_MINUTES * 60)
+        time.sleep(5 * 60)  # Monitoraggio ogni 5 minuti
 
 if __name__ == "__main__":
-    send_alert("🚀 CryptoScout avviato. Monitoraggio in corso ogni 10 minuti...")
+    send_alert("🚀 CryptoScout attivo. Monitoraggio ogni 5 minuti. Alert su variazioni ≥6% in 10 minuti.")
     monitor()
