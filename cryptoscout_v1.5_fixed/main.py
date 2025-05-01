@@ -1,101 +1,63 @@
-# main.py — CryptoScout PURE v1.5
-
 import requests
 import time
-import os
-from datetime import datetime, timezone, timedelta
-from telegram import Bot
+from datetime import datetime
+import pytz
+import telegram
+from config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, COINBASE_ONLY, ALERT_THRESHOLD_PERCENT, MONITOR_INTERVAL_MINUTES, TIMEZONE
 
-# Configurazioni personalizzate
-token = os.getenv("TELEGRAM_TOKEN")
-chat_id = os.getenv("TELEGRAM_CHAT_ID")
-bot = Bot(token=token)
+bot = telegram.Bot(token=TELEGRAM_TOKEN)
 
-ALERT_THRESHOLD = 6.0  # percentuale
-CHECK_INTERVAL = 300  # ogni 5 minuti
-COINBASE_API = "https://api.pro.coinbase.com/products"
-MARKET_CAP_API = "https://api.coingecko.com/api/v3/coins/markets"
-COINBASE_BASE = "https://www.coinbase.com/price/"
+previous_prices = {}
 
-# Cache dei prezzi precedenti
-last_prices = {}
+def get_coinbase_prices():
+    url = "https://api.coinbase.com/v2/prices/USD/spot"
+    try:
+        response = requests.get(url)
+        if response.status_code == 200:
+            data = response.json()
+            prices = data.get("data", [])
+            if isinstance(prices, dict):
+                return [prices]
+            return prices
+        else:
+            print(f"Errore Coinbase: codice {response.status_code}")
+            return []
+    except Exception as e:
+        print(f"Eccezione nel recupero prezzi Coinbase: {e}")
+        return []
 
-# Affidabilità stimata per capitalizzazione
-
-def get_reliability(market_cap):
-    if market_cap >= 10_000_000_000:
-        return "Alta"
-    elif market_cap >= 1_000_000_000:
-        return "Media"
-    else:
-        return "Bassa"
-
-
-def fetch_coinbase_pairs():
-    res = requests.get(COINBASE_API)
-    return [p['id'] for p in res.json() if p['quote_currency'] == 'USD']
-
-
-def fetch_market_data():
-    params = {
-        "vs_currency": "usd",
-        "order": "market_cap_desc",
-        "per_page": 250,
-        "page": 1,
-        "sparkline": False
-    }
-    res = requests.get(MARKET_CAP_API, params=params)
-    return {coin['symbol'].upper(): coin for coin in res.json()}
-
-
-def format_alert(symbol, name, variation, volume_change, reliability):
-    url = f"{COINBASE_BASE}{symbol.lower()}"
-    return (f"\n🚨 CryptoScout PURE v1.5 — Opportunità individuata"
-            f"\n\n🪙 Criptovaluta: {name} ({symbol})"
-            f"\n📈 Variazione 5min: +{variation:.2f}%"
-            f"\n📊 Volume spike: +{volume_change:.1f}%"
-            f"\n✅ Affidabilità: {reliability}"
-            f"\n🕒 Orario: {datetime.now(timezone.utc).astimezone(tz=timezone(timedelta(hours=2))).strftime('%H:%M')} CET"
-            f"\n\n📎 Link: {url}")
-
+def send_alert(message):
+    try:
+        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+    except Exception as e:
+        print(f"Errore nell'invio dell'alert Telegram: {e}")
 
 def monitor():
-    coinbase_ids = fetch_coinbase_pairs()
-    market_data = fetch_market_data()
+    global previous_prices
+    while True:
+        prices = get_coinbase_prices()
+        now = datetime.now(pytz.timezone(TIMEZONE)).strftime('%H:%M')
 
-    for product_id in coinbase_ids:
-        try:
-            res = requests.get(f"https://api.pro.coinbase.com/products/{product_id}/ticker")
-            ticker = res.json()
-            symbol = product_id.split("-")[0]
-            price = float(ticker['price'])
-            volume = float(ticker['volume'])
+        if not prices:
+            print(f"[{now}] Nessun dato ricevuto.")
+            send_alert(f"⚠️ {now} - Nessun dato ricevuto da Coinbase.")
+        else:
+            for entry in prices:
+                base = entry.get("base")
+                amount = float(entry.get("amount"))
 
-            # Calcolo variazione prezzo
-            if symbol not in last_prices:
-                last_prices[symbol] = (price, volume)
-                continue
+                if base in previous_prices:
+                    prev = previous_prices[base]
+                    change_pct = ((amount - prev) / prev) * 100
+                    if abs(change_pct) >= ALERT_THRESHOLD_PERCENT:
+                        direction = "📈" if change_pct > 0 else "📉"
+                        msg = f"{direction} {now} - {base} ha avuto una variazione del {change_pct:.2f}% ed è ora a {amount} USD."
+                        send_alert(msg)
 
-            old_price, old_volume = last_prices[symbol]
-            variation = ((price - old_price) / old_price) * 100
-            volume_change = ((volume - old_volume) / old_volume) * 100 if old_volume > 0 else 0
-            last_prices[symbol] = (price, volume)
+                previous_prices[base] = amount
 
-            # Check soglia
-            if variation >= ALERT_THRESHOLD and volume_change > 50:
-                if symbol in market_data:
-                    info = market_data[symbol]
-                    name = info['name']
-                    market_cap = info['market_cap'] or 0
-                    reliability = get_reliability(market_cap)
-                    alert = format_alert(symbol, name, variation, volume_change, reliability)
-                    bot.send_message(chat_id=chat_id, text=alert)
-        except Exception as e:
-            print(f"Errore su {product_id}: {e}")
-
+        time.sleep(MONITOR_INTERVAL_MINUTES * 60)
 
 if __name__ == "__main__":
-    bot.send_message(chat_id=chat_id, text="🚀 CryptoScout PURE v1.5 attivo e in ascolto su Coinbase.")
-    while True:
-        monitor()
-        time.sleep(CHECK_INTERVAL)
+    send_alert("🚀 CryptoScout avviato. Monitoraggio in corso ogni 10 minuti...")
+    monitor()
