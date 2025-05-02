@@ -1,118 +1,92 @@
 import requests
 import time
-from datetime import datetime
-import pytz
-import telegram
-from collections import deque
-from config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, COINBASE_ONLY, ALERT_THRESHOLD_PERCENT, TIMEZONE
+from datetime import datetime, timedelta
+from config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, ALERT_THRESHOLD_PERCENT, MONITOR_INTERVAL_MINUTES, TIMEZONE
 
-bot = telegram.Bot(token=TELEGRAM_TOKEN)
+API_URL = "https://api.coinbase.com/v2/prices/{}/spot"
+PRODUCTS_URL = "https://api.exchange.coinbase.com/products"
 
-# Salviamo gli ultimi 2 prezzi e volumi per ogni coin
-previous_data = {}  # base: deque(maxlen=2)
+previous_prices = {}
+price_history = {}
+volume_history = {}
 
-COINGECKO_API = "https://api.coingecko.com/api/v3/coins/markets"
+HEADERS = {
+    "User-Agent": "CryptoScout PURE v1.5"
+}
 
-# Mappa simboli per nomi e market cap
-market_info = {}
-
-def update_market_info():
+def send_telegram_message(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
     try:
-        response = requests.get(COINGECKO_API, params={
-            'vs_currency': 'usd',
-            'order': 'market_cap_desc',
-            'per_page': 250,
-            'page': 1,
-            'sparkline': 'false'
-        })
+        requests.post(url, data=data)
+    except Exception as e:
+        print("Errore nell'invio del messaggio Telegram:", e)
+
+def get_usdt_pairs():
+    response = requests.get(PRODUCTS_URL, headers=HEADERS)
+    pairs = response.json()
+    return [p['id'] for p in pairs if p['quote_currency'] == 'USDT' and p['base_currency'] not in ['USDT', 'EUR', 'USD']]
+
+def fetch_price(product_id):
+    try:
+        url = API_URL.format(product_id.replace("-", ""))
+        response = requests.get(url, headers=HEADERS)
+        price = float(response.json()['data']['amount'])
+        return price
+    except:
+        return None
+
+def fetch_volume(product_id):
+    try:
+        url = f"https://api.exchange.coinbase.com/products/{product_id}/stats"
+        response = requests.get(url, headers=HEADERS)
         data = response.json()
-        for coin in data:
-            market_info[coin['symbol'].upper()] = {
-                'name': coin['name'],
-                'market_cap': coin.get('market_cap', 0)
-            }
-    except Exception as e:
-        print(f"Errore aggiornamento info CoinGecko: {e}")
-
-def get_reliability(market_cap):
-    if market_cap >= 10_000_000_000:
-        return "Alta"
-    elif market_cap >= 1_000_000_000:
-        return "Media"
-    else:
-        return "Bassa"
-
-def get_coinbase_prices():
-    url = "https://api.coinbase.com/v2/prices/USD/spot"
-    try:
-        response = requests.get(url)
-        if response.status_code == 200:
-            data = response.json()
-            prices = data.get("data", [])
-            if isinstance(prices, dict):
-                return [prices]
-            return prices
-        else:
-            print(f"Errore Coinbase: codice {response.status_code}")
-            return []
-    except Exception as e:
-        print(f"Eccezione nel recupero prezzi Coinbase: {e}")
-        return []
-
-def send_alert(symbol, name, amount, change_pct, volume_change, reliability, now):
-    direction = "📈" if change_pct > 0 else "📉"
-    msg = (
-        f"🚨 CryptoScout PURE v1.5 — Opportunità individuata\n\n"
-        f"🪙 Criptovaluta: {name} ({symbol})\n"
-        f"📈 Variazione 10min: {change_pct:.2f}%\n"
-        f"📊 Volume spike: {volume_change:.1f}%\n"
-        f"✅ Affidabilità: {reliability}\n"
-        f"🕒 Orario: {now} CET\n\n"
-        f"📎 https://www.coinbase.com/price/{symbol.lower()}"
-    )
-    try:
-        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
-    except Exception as e:
-        print(f"Errore nell'invio dell'alert Telegram: {e}")
+        volume = float(data['volume'])
+        return volume
+    except:
+        return 0.0
 
 def monitor():
-    global previous_data
-    update_market_info()
+    pairs = get_usdt_pairs()
+    now = datetime.now()
 
-    while True:
-        prices = get_coinbase_prices()
-        now = datetime.now(pytz.timezone(TIMEZONE)).strftime('%H:%M')
+    for pair in pairs:
+        price = fetch_price(pair)
+        if not price:
+            continue
 
-        if not prices:
-            print(f"[{now}] Nessun dato ricevuto.")
-            bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"⚠️ {now} - Nessun dato ricevuto da Coinbase.")
-        else:
-            for entry in prices:
-                base = entry.get("base")
-                amount = float(entry.get("amount"))
-                volume = float(entry.get("volume", 0))
+        volume = fetch_volume(pair)
+        if pair not in price_history:
+            price_history[pair] = []
+            volume_history[pair] = []
 
-                if base not in previous_data:
-                    previous_data[base] = deque(maxlen=2)
+        price_history[pair].append((now, price))
+        volume_history[pair].append((now, volume))
 
-                data_history = previous_data[base]
-                data_history.append((amount, volume))
+        # Pulisce le entry troppo vecchie (oltre 10 minuti)
+        price_history[pair] = [(t, p) for t, p in price_history[pair] if t >= now - timedelta(minutes=10)]
+        volume_history[pair] = [(t, v) for t, v in volume_history[pair] if t >= now - timedelta(minutes=10)]
 
-                if len(data_history) == 2:
-                    old_price, old_volume = data_history[0]
-                    change_pct = ((amount - old_price) / old_price) * 100
-                    volume_change = ((volume - old_volume) / old_volume) * 100 if old_volume > 0 else 0
+        # Verifica se abbiamo dati di almeno 10 minuti fa
+        if len(price_history[pair]) > 1 and price_history[pair][0][0] <= now - timedelta(minutes=10):
+            old_price = price_history[pair][0][1]
+            change_percent = ((price - old_price) / old_price) * 100
 
-                    if change_pct >= ALERT_THRESHOLD_PERCENT and volume_change > 50:
-                        symbol = base
-                        info = market_info.get(symbol, {})
-                        name = info.get('name', symbol)
-                        market_cap = info.get('market_cap', 0)
-                        reliability = get_reliability(market_cap)
-                        send_alert(symbol, name, amount, change_pct, volume_change, reliability, now)
-
-        time.sleep(5 * 60)
+            if abs(change_percent) >= ALERT_THRESHOLD_PERCENT:
+                # Volume spike detection
+                volumes = [v for _, v in volume_history[pair]]
+                if len(volumes) >= 2:
+                    avg_volume = sum(volumes[:-1]) / (len(volumes) - 1)
+                    if volume > avg_volume * 2:
+                        direction = "📈" if change_percent > 0 else "📉"
+                        msg = f"{direction} {now.strftime('%H:%M')} - {pair.replace('-USDT', '')} ha avuto una variazione del {change_percent:.2f}% negli ultimi 10 minuti con spike di volume. Ora a {price} USD."
+                        send_telegram_message(msg)
 
 if __name__ == "__main__":
-    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🚀 CryptoScout PURE v1.5 avviato. Monitoraggio ogni 5 minuti, alert su variazioni >=6% in 10 minuti con volume spike.")
-    monitor()
+    send_telegram_message("📡 CryptoScout PURE v1.5 attivo. Monitoraggio ogni 5 minuti, alert su variazioni >=6% in 10 minuti con volume spike.")
+    while True:
+        try:
+            monitor()
+        except Exception as e:
+            print("Errore durante il monitoraggio:", e)
+        time.sleep(MONITOR_INTERVAL_MINUTES * 60)
